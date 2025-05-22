@@ -1,0 +1,260 @@
+version: '3.8'
+
+x-java-service-environment: &java-service-env
+  DB_JDBC_URL: "jdbc:postgresql://postgres:5432/mydb"
+  DB_USER: "user"
+  DB_PASSWORD: "password"
+  DB_DRIVER: "org.postgresql.Driver"
+  KAFKA_CONSUMER_BOOTSTRAP_SERVERS: "kafka:9092"
+  KAFKA_CONSUMER_GROUP_ID: "group_consumer"
+  KAFKA_CONSUMER_AUTO_OFFSET_RESET: "earliest"
+  KAFKA_PRODUCER_BOOTSTRAP_SERVERS: "kafka:9092"
+  APPLICATION_UPDATE_INTERVAL_SEC: "30"
+
+x-java-service-base: &java-service-base
+  depends_on:
+    postgres:
+      condition: service_healthy
+    kafka:
+      condition: service_started
+  networks:
+    - app-network
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - app-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    networks:
+      - app-network
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: mydb
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U user -d mydb" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - app-network
+
+  redis:
+    image: redis:5.0.3-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  mongodb:
+    image: mongo:4.0.10
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: user
+      MONGO_INITDB_ROOT_PASSWORD: password
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongo", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - app-network
+
+  java_service_filtering:
+    <<: *java-service-base
+    image: maximpokez/java_service_filtering:latest
+    environment:
+      <<: *java-service-env
+      FILTERING_KAFKA_CONSUMER_TOPICS: "start_topic"
+      FILTERING_KAFKA_PRODUCER_TOPIC: "topic_after_filtering"
+      FILTERING_SERVER_PORT: "8082"
+
+  java_service_deduplication:
+    <<: *java-service-base
+    image: maximpokez/java_service_deduplication:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *java-service-env
+      DEDUPLICATION_KAFKA_CONSUMER_TOPICS: "topic_after_filtering"
+      DEDUPLICATION_KAFKA_PRODUCER_TOPIC: "topic_after_deduplication"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      DEDUPLICATION_SERVER_PORT: "8083"
+    networks:
+      - app-network
+
+  java_service_enrichment:
+    <<: *java-service-base
+    image: maximpokez/java_service_enrichment:latest
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      <<: *java-service-env
+      ENRICHMENT_KAFKA_CONSUMER_TOPICS: "topic_after_deduplication"
+      ENRICHMENT_KAFKA_PRODUCER_TOPIC: "topic_after_enrichment"
+      ENRICHMENT_MONGO_CONNECTION_STRING: "mongodb://user:password@mongodb:27017"
+      ENRICHMENT_MONGO_DATABASE: "enrichment_db"
+      ENRICHMENT_MONGO_COLLECTION: "enrichment_rules"
+      ENRICHMENT_APPLICATION_ENRICHMENT_ID: "1"
+      ENRICHMENT_SERVER_PORT: "8085"
+
+  java-service-management:
+    <<: *java-service-base
+    image: maximpokez/java_service_management:latest
+    environment:
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://postgres:5432/mydb"
+      SPRING_DATASOURCE_USERNAME: "user"
+      SPRING_DATASOURCE_PASSWORD: "password"
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: "org.postgresql.Driver"
+
+      SPRING_JPA_HIBERNATE_DDL_AUTO: "update"
+      SPRING_JPA_DATABASE: "postgresql"
+      SPRING_JPA_DATABASE_PLATFORM: "org.hibernate.dialect.PostgreSQLDialect"
+      SPRING_JPA_SHOW_SQL: "true"
+      SPRING_JPA_PROPERTIES_HIBERNATE_FORMAT_SQL: "true"
+
+      SERVER_PORT: "8081"
+
+  java-service-authorization:
+    image: maximpokez/java_service_autorization:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      java-service-management:
+        condition: service_started
+    environment:
+      DB_USERNAME: "user"
+      DB_PASSWORD: "password"
+      DB_DRIVER: "jdbc:postgresql"
+      DB_HOST: "postgres"
+      DB_PORT: "5432"
+      DB_NAME: "mydb"
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      MANAGEMENT_HTTP_PROTOCOL: http
+      MANAGEMENT_HOST: java-service-management
+      MANAGEMENT_PORT: 8081
+      DEDUPLICATION_BASE_PATH: deduplication
+      ENRICHMENT_BASE_PATH: enrichment
+      FILTER_BASE_PATH: filter
+
+      APPLICATION_PORT: 8084
+
+      SPRING_PROFILES_ACTIVE: "prod"
+      SPRING_LIQUIBASE_ENABLED: "true"
+
+      TOPIC_START: "start_topic"
+      TOPIC_FINISH: "topic_after_enrichment"
+    ports:
+      - "8080:8084"
+    networks:
+      - app-network
+
+  postgres_exporter:
+    image: prometheuscommunity/postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://user:password@postgres:5432/mydb?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      - postgres
+    networks:
+      - app-network
+
+  redis_exporter:
+    image: oliver006/redis_exporter
+    command: [ "--redis.addr=redis://redis:6379" ]
+    ports:
+      - "9121:9121"
+    depends_on:
+      - redis
+    networks:
+      - app-network
+
+  mongodb_exporter:
+    image: percona/mongodb_exporter:0.39
+    environment:
+      MONGODB_URI: "mongodb://user:password@mongodb:27017"
+    ports:
+      - "9216:9216"
+    depends_on:
+      - mongodb
+    networks:
+      - app-network
+
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    depends_on:
+      - java-service-authorization
+      - java-service-management
+      - java_service_filtering
+      - java_service_deduplication
+      - java_service_enrichment
+    networks:
+      - app-network
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      - prometheus
+    networks:
+      - app-network
+
+volumes:
+  pgdata:
+  redis_data:
+  mongodb_data:
+  grafana_data:
+
+networks:
+  app-network:
+    driver: bridge
