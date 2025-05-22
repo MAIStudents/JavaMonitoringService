@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'spring-boot-services'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['java-service-authorization:8084', 'java-service-management:8081']
+        labels:
+          group: 'spring-services'
+
+  - job_name: 'java-services'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: [ 'java_service_filtering:8082', 'java_service_deduplication:8083', 'java_service_enrichment:8085' ]
+
+  - job_name: 'postgres'
+    static_configs:
+      - targets: [ 'postgres_exporter:9187' ]
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: [ 'redis_exporter:9121' ]
+
+  - job_name: 'mongodb'
+    static_configs:
+      - targets: [ 'mongodb_exporter:9216' ]
